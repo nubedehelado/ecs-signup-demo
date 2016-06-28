@@ -1,0 +1,389 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "CloudFormation template for deploying a dockerized flask app with a DynamoDB backend on ECS",
+
+  "Parameters": {
+
+    "InstanceType": {
+      "Type": "String",
+      "Description": "ECS instance type",
+      "Default": "t2.micro",
+      "AllowedValues": ["t2.micro", "t2.small", "t2.medium", "t2.large"],
+      "ConstraintDescription": "must be a valid T2 EC2 instance type."
+    },
+
+    "DesiredCapacity": {
+      "Type": "Number",
+      "Default" : "1",
+      "Description": "Number of instances to launch in your ECS cluster."
+    }, 
+
+    "MaxSize": {
+      "Type": "Number",
+      "Default" : "1",
+      "Description": "Maximum number of instances that can be launched in your ECS cluster."
+    },
+
+    "SourceCidr": {
+      "Type": "String",
+      "Description": "Optional - CIDR/IP range for ECS instance outside access - defaults to 0.0.0.0/0",
+      "Default": "0.0.0.0/0"
+    }
+  },
+
+  "Mappings": {
+    "AWSRegionToAMI": {
+      "us-east-1": {
+        "AMI": "ami-a88a46c5"
+      },
+      "us-west-1": {
+        "AMI": "ami-34a7e354"
+      },
+      "us-west-2": {
+        "AMI": "ami-ae0acdce"
+      }
+    }
+  },
+
+  "Resources": {
+
+    "ECSCluster": {
+      "Type": "AWS::ECS::Cluster"
+    },  
+
+    "ECSLogGroup": {
+      "Type" : "AWS::Logs::LogGroup",
+      "Properties" : {
+        "RetentionInDays" : 7
+      }
+    },
+
+    "ECSTaskDefinition": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties" : {
+        "ContainerDefinitions" : [
+        {
+          "Name": "flask-app",
+          "Image": { "Fn::Join": [ "", [ { "Ref" : "AWS::AccountId" }, ".dkr.ecr.", {"Ref": "AWS::Region"}, ".amazonaws.com/ecs-demo1"]]  },
+          "Memory":"256",
+          "Essential": "true",
+          "PortMappings":[
+            {
+              "ContainerPort": "80",
+              "HostPort": "80"
+            }
+          ],
+          "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                  "awslogs-group": { "Ref": "ECSLogGroup" },
+                  "awslogs-region": { "Ref": "AWS::Region" }
+              }
+          },
+          "Environment": [
+            {
+              "Name": "AWS_REGION",
+              "Value": { "Ref": "AWS::Region" }
+            },
+            {
+              "Name": "STARTUP_SIGNUP_TABLE",
+              "Value": { "Ref": "MyDynamoDbTable" }
+            }
+          ]
+        }]
+      }
+    },
+
+    "EcsElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "SecurityGroups" : [{ "Ref" : "ECSELBSecurityGroup" }],
+        "Listeners" : [ {
+          "LoadBalancerPort" : "80",
+          "InstancePort" : "80",
+          "Protocol" : "HTTP"
+        } ],
+        "HealthCheck" : {
+          "Target" : "HTTP:80/",
+          "HealthyThreshold" : "2",
+          "UnhealthyThreshold" : "10",
+          "Interval" : "30",
+          "Timeout" : "5"
+        }
+      }
+    },
+
+    "ECSELBSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Security Group for ECS Instances",
+        "SecurityGroupIngress": [
+        {
+          "IpProtocol": "tcp",
+          "FromPort": "80",
+          "ToPort": "80",
+          "CidrIp": "SourceCidr"
+        },
+        {
+          "IpProtocol": "tcp",
+          "FromPort": "443",
+          "ToPort": "443",
+          "CidrIp": "SourceCidr"
+        }
+      ]}
+    },
+
+  "ECSAutoScalingGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "LaunchConfigurationName" : { "Ref" : "ContainerInstances" },
+        "MinSize" : "1",
+        "MaxSize" : { "Ref" : "MaxSize" },
+        "DesiredCapacity" : { "Ref" : "DesiredCapacity" }
+      },
+      "CreationPolicy" : {
+        "ResourceSignal" : {
+          "Timeout" : "PT15M"
+        }
+      },
+      "UpdatePolicy": {
+        "AutoScalingRollingUpdate": {
+          "MinInstancesInService": "1",
+          "MaxBatchSize": "1",
+          "PauseTime" : "PT15M",
+          "WaitOnResourceSignals": "true"
+        }
+      }
+    },    
+    "ContainerInstances": {
+      "Type": "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+          
+            "commands" : {
+              "01_add_instance_to_cluster" : {
+                "command" : { "Fn::Join": [ "", [ "#!/bin/bash\n", "echo ECS_CLUSTER=", { "Ref": "ECSCluster" }, " >> /etc/ecs/ecs.config" ] ] }
+              }
+            },
+            
+            "files" : {
+              "/etc/cfn/cfn-hup.conf" : {
+                "content" : { "Fn::Join" : ["", [
+                  "[main]\n",
+                  "stack=", { "Ref" : "AWS::StackId" }, "\n",
+                  "region=", { "Ref" : "AWS::Region" }, "\n"
+                ]]},
+                "mode"    : "000400",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+              "/etc/cfn/hooks.d/cfn-auto-reloader.conf" : {
+                "content": { "Fn::Join" : ["", [
+                  "[cfn-auto-reloader-hook]\n",
+                  "triggers=post.update\n",
+                  "path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init\n",
+                  "action=/opt/aws/bin/cfn-init -v ",
+                  "         --stack ", { "Ref" : "AWS::StackName" },
+                  "         --resource ContainerInstances ",
+                  "         --region ", { "Ref" : "AWS::Region" }, "\n",
+                  "runas=root\n"
+                ]]}
+              }
+            },
+
+            "services" : {
+              "sysvinit" : {
+                "cfn-hup" : { "enabled" : "true", "ensureRunning" : "true", "files" : ["/etc/cfn/cfn-hup.conf", "/etc/cfn/hooks.d/cfn-auto-reloader.conf"] }
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionToAMI", { "Ref" : "AWS::Region" }, "AMI" ] },
+        "InstanceType"   : { "Ref" : "InstanceType" },
+        "IamInstanceProfile": { "Ref": "EcsNodeInstanceProfile" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+             "#!/bin/bash -xe\n",
+             "yum install -y aws-cfn-bootstrap\n",
+
+             "/opt/aws/bin/cfn-init -v ",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource ContainerInstances ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n",
+
+             "/opt/aws/bin/cfn-signal -e $? ",
+             "         --stack ", { "Ref" : "AWS::StackName" },
+             "         --resource ECSAutoScalingGroup ",
+             "         --region ", { "Ref" : "AWS::Region" }, "\n"
+        ]]}}
+      }
+    },    
+    "service": {
+      "Type": "AWS::ECS::Service",
+      "DependsOn": ["ECSAutoScalingGroup"],
+      "Properties" : {
+        "Cluster": {"Ref": "ECSCluster"},
+        "DesiredCount": "1",
+        "LoadBalancers": [
+          {
+            "ContainerName": "flask-app",
+            "ContainerPort": "80",
+            "LoadBalancerName" : { "Ref" : "EcsElasticLoadBalancer" }
+          }
+        ],
+        "Role" : {"Ref": "EcsNodeEC2TrustAccessRole"},
+        "TaskDefinition" : {"Ref":"ECSTaskDefinition"}
+      }
+    },
+    "ECSServiceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ecs.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Path": "/",
+        "Policies": [
+          {
+            "PolicyName": "ecs-service",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "elasticloadbalancing:Describe*",
+                    "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                    "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                    "ec2:Describe*",
+                    "ec2:AuthorizeSecurityGroupIngress"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },    
+
+     "EcsNodeInstanceProfile": {
+            "Properties": {
+                "Path": "/",
+                "Roles": [
+                    {
+                        "Ref": "EcsNodeEC2TrustAccessRole"
+                    }
+                ]
+            },
+            "Type": "AWS::IAM::InstanceProfile"
+        },
+        "EcsNodeEC2TrustAccessRole": {
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Statement": [
+                        {
+                            "Action": [
+                                "sts:AssumeRole"
+                            ],
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": [
+                                    "ec2.amazonaws.com"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "Path": "/"
+            },
+            "Type": "AWS::IAM::Role"
+        },
+        "EcsNodeInstancePolicy": {
+            "Properties": {
+                "PolicyDocument": {
+                    "Statement": [
+                        {
+                            "Action": [
+                                "ecs:CreateCluster",
+                                "ecs:DeregisterContainerInstance",
+                                "ecs:DiscoverPollEndpoint",
+                                "ecs:Poll",
+                                "ecs:RegisterContainerInstance",
+                                "ecs:StartTelemetrySession",
+                                "ecs:Submit*",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents",
+                                "dynamodb:PutItem",
+                                "dynamodb:UpdateItem",
+                                "dynamodb:DeleteItem"
+                            ],
+                            "Effect": "Allow",
+                            "Resource": "*"
+                        }
+                    ]
+                },
+                "PolicyName": "EcsNodePolicy",
+                "Roles": [
+                    {
+                        "Ref": "EcsNodeEC2TrustAccessRole"
+                    }
+                ]
+            },
+            "Type": "AWS::IAM::Policy"
+        },
+
+    "MyDynamoDbTable": {
+            "Type" : "AWS::DynamoDB::Table",
+            "Properties" : {
+                "AttributeDefinitions" : [
+                  {
+                    "AttributeName" : "email",
+                    "AttributeType" : "S"   
+                  }
+                ],
+                "KeySchema" : [
+                  {
+                    "AttributeName" : "email",
+                    "KeyType" : "HASH"
+                  }
+                ],
+                "ProvisionedThroughput" : {
+                  "ReadCapacityUnits" : "5",
+                  "WriteCapacityUnits" : "5"
+                },
+                "TableName" : "new_startup_signups"
+            }
+        }
+  },
+
+  "Outputs": {
+
+     "ecsservice" : {
+        "Value" : { "Ref" : "service" }
+      },
+      "ecscluster" : {
+        "Value" : { "Ref" : "ECSCluster" }
+      },
+      "taskdef" : {
+        "Value" : { "Ref" : "ECSTaskDefinition" }
+      },
+      "ClusterDNS" : {
+      "Description" : "URL for newly created ECS cluster",
+       "Value" : { "Fn::Join" : ["", ["http://", { "Fn::GetAtt" : [ "EcsElasticLoadBalancer", "DNSName" ]}]] }
+    }
+  }
+}
